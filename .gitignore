@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.pyo
+build/
+dist/
+RFID_EPC_Uploader.spec
+.venv/
+venv/
+*.log
