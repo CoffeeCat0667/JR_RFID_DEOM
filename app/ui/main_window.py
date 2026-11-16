@@ -374,7 +374,6 @@ class MainWindow(QMainWindow):
             self.url_edit.text().strip(),
             device_id=self.device_edit.text().strip(),
             on_log=self._bridge.log.emit,
-            get_user=self._reader.get_user if self._reader is not None else None,
         )
         self._uploader.start()
 
