@@ -24,7 +24,7 @@
 | 帧解析 | 按 PL 长度切帧，不依赖帧尾搜索；校验和 `sum(Type..最后参数) & 0xFF` |
 | EPC 解析 | `RSSI(1) + PC(2) + EPC(PL-5) + CRC(2)`，EPC 大写十六进制 |
 | 缓冲区 | 线程安全；批内按 EPC 去重；上限 5000 条 |
-| HTTP | `POST` + `application/json`，请求体为 EPC 字符串数组；失败重试 3 次后回填 |
+| HTTP | `POST` + `application/json`，请求体见 §3A（EPC + User 对象数组）；失败重试 3 次后回填 |
 | 界面 | 串口/波特率/地址选择、状态与统计、最近标签表、日志 |
 | 日志/配置 | `%LOCALAPPDATA%\JRRFID\logs\`、`%LOCALAPPDATA%\JRRFID\config.json` |
 | 验证服务器 | `verify\rfid_server.py`，单文件标准库实现，Web 可视化 |
@@ -190,7 +190,7 @@ Read：  BB 00 39 00 09 00 00 00 00 03 00 00 00 04 <CK> 7E
 | `README.md` | 写入页改为 User 区数据写入的说明与限制 |
 | `PLAN.md` | 本文件 |
 
-不改动：`app/buffer.py`、`app/uploader.py`、HTTP 上报与 2 秒聚合、`verify/rfid_server.py`、现有采集/去重/轮询行为。
+不改动：`app/buffer.py`、现有采集/去重/轮询行为、2 秒聚合；`app/uploader.py` 与 `verify/rfid_server.py` 的上报格式改动见 §3A.2。
 
 ### 3.8 测试与验收
 
@@ -252,7 +252,7 @@ Read：  BB 00 39 00 09 00 00 00 00 03 00 00 00 04 <CK> 7E
 | 请求方法/地址 | 不变：`POST`，界面填写的 `http://<MES IP>:8080/api/epc` |
 | Content-Type | 固定 `application/json` |
 | 设备 ID | 界面新增“设备 ID”，默认 `RFID-PLATE-001`，作为 `X-Device-Id` 请求头；随配置保存 |
-| 请求体 | 不变：EPC 字符串数组（大写、去重） |
+| 请求体 | JSON 对象数组，每个元素 `{"epc": "...", "user": "..."}`（大写十六进制、批内去重）；`user` 固定 16 字节（32 个 hex 字符），无 User 数据时补 `00` |
 | 成功判定 | HTTP 2xx 且响应 JSON 为 `{"ok": true}` |
 | 业务失败 | HTTP 200 + `{"ok": false}` → 记一次上传失败，丢弃该批，**不重试** |
 | 格式错误 | 400 / 非 JSON / 缺少布尔 `ok` → 记失败，丢弃该批，不重试 |
@@ -261,6 +261,47 @@ Read：  BB 00 39 00 09 00 00 00 00 03 00 00 00 04 <CK> 7E
 | 聚合 | 缓冲区出现数据后等待 2 秒静默窗口，期间新增的唯一 EPC 一并合并，再发一次请求；重复读到同一 EPC 不重置计时 |
 
 说明：持续放在检测板上的标签会每约 2 秒形成一批重复上报，MES 侧有幂等保护；本版不做“标签离开再上报”的存在检测。
+
+### 3A.1 EPC + User 数据上报
+
+| 项 | 决定 |
+|---|---|
+| 上报内容 | 每条为一个对象 `{"epc": "<EPC>", "user": "<16 字节 User>"}` |
+| User 长度 | 固定 16 字节（`0x39`：`MemBank=03`、`SA=0`、`DL=8`）；不足 16 字节按右侧补 `00`，超出截断 |
+| 读取时机 | 轮询首次识别到新的唯一 EPC 时，暂停一次轮询执行 `0x0C` Select + `0x39` 读 User，结果按 EPC 缓存在内存 |
+| 读取失败 | 超时、`0xFF` 错误（如无 User 区 `0xB3`）、回读 EPC 不一致 → 该 EPC 缓存 16 字节 `00`，不阻塞采集与上报 |
+| 重复读取 | 同一次采集运行内同一 EPC 只读一次；停止采集后缓存随 Reader 丢弃 |
+| 写入联动 | 写入页成功后更新该 EPC 缓存：写入值截断/补零到 16 字节 |
+| 上报取值 | 上传线程按 EPC 取缓存；缓存缺失时按 16 字节 `00` |
+| 不变项 | 2 秒静默聚合、批内去重、`X-Device-Id`、`{"ok": true}` 判定、重试与丢弃规则保持不变 |
+
+示例请求体：
+
+```json
+[
+  {"epc": "30751FEB705C5904E3D50D70", "user": "E2003412AABBCCDD0000000000000000"},
+  {"epc": "E2003412AABBCCDDEEFF0011", "user": "00000000000000000000000000000000"}
+]
+```
+
+注意：该格式与 `docs/RFID检测板对接协议.md` 中的字符串数组不同，MES 侧需按对象解析；`verify\rfid_server.py` 已同步接受该对象数组（按 `epc` 统计，`user` 只做类型校验）。
+
+已知取舍：首次识别读 User 时，若标签已离开，Select/读各等待最长 1 秒超时；这段等待期间收到的其它标签通知帧不会被计入缓冲区。
+
+### 3A.2 代码改动点（EPC + User 上报）
+
+| 文件 | 改动 |
+|---|---|
+| `app/protocol.py` | 新增固定的上报 User 长度常量与 User 区读取字数常量 |
+| `app/reader.py` | 新增 EPC → User 缓存；首次识别新 EPC 时 Select + 读 User；提供线程安全读取接口；写入成功后更新缓存 |
+| `app/uploader.py` | 请求体改为 EPC + User 对象数组，按 EPC 取缓存，缺失补 0 |
+| `app/ui/main_window.py` | 创建 `Uploader` 时传入 Reader 的 User 缓存读取接口 |
+| `tests/test_uploader.py` | 断言对象格式、`user` 字段与补 0 |
+| `tests/test_writer.py` | 增加首次识别读 User 缓存、读取失败补 0、写入后更新缓存 |
+| `README.md` | 补充上报对象格式、16 字节规则与读取时机 |
+| `verify/rfid_server.py` | 改为接受 `[{"epc","user"}]` 对象数组，按 EPC 统计 |
+
+不改动：2 秒聚合、缓冲区结构、重试规则。
 
 ---
 

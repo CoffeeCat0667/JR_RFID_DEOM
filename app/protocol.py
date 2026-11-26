@@ -21,6 +21,11 @@ CMD_ERROR = 0xFF
 MEM_BANK_USER = 0x03
 MAX_EPC_MASK_LEN = 31
 
+# 上报固定携带的 User 区长度（字节）与对应读取字数。
+USER_DATA_LEN = 16
+USER_DATA_WORDS = USER_DATA_LEN // 2
+USER_DATA_ZERO = "00" * USER_DATA_LEN
+
 # 协议中所有已定义帧的参数长度都远小于该值，用于从垃圾字节中重新同步。
 MAX_PARAM_LEN = 256
 

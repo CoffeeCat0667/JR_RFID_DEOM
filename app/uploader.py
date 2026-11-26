@@ -9,6 +9,7 @@ import urllib.error
 import urllib.request
 from typing import Callable
 
+from app import protocol
 from app.buffer import TagBuffer
 
 HTTP_TIMEOUT = 10.0
@@ -28,6 +29,7 @@ class Uploader(threading.Thread):
         url: str,
         device_id: str = DEFAULT_DEVICE_ID,
         on_log: Callable[[str], None] | None = None,
+        get_user: Callable[[str], str] | None = None,
         timeout: float = HTTP_TIMEOUT,
         attempts: int = ATTEMPTS,
     ) -> None:
@@ -36,6 +38,7 @@ class Uploader(threading.Thread):
         self._url = url
         self._device_id = device_id.strip() or DEFAULT_DEVICE_ID
         self.on_log = on_log
+        self._get_user = get_user or (lambda epc: protocol.USER_DATA_ZERO)
         self._timeout = timeout
         self._attempts = attempts
         self._stop_event = threading.Event()
@@ -52,7 +55,10 @@ class Uploader(threading.Thread):
             batch = self._buffer.take_batch(AGGREGATE_WINDOW)
             if batch is None:
                 return
-            payload = json.dumps([epc for epc, _ in batch], ensure_ascii=False).encode("utf-8")
+            payload = json.dumps(
+                [{"epc": epc, "user": self._get_user(epc)} for epc, _ in batch],
+                ensure_ascii=False,
+            ).encode("utf-8")
             ok, retryable, error = self._post(payload)
             if ok:
                 self.success_batches += 1
