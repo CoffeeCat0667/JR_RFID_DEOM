@@ -188,7 +188,7 @@ class MainWindow(QMainWindow):
         root = QWidget()
         layout = QVBoxLayout(root)
 
-        tip = QLabel("需先在“采集”页开始采集。选中标签后输入 2~64 字节的 HEX 数据写入标签 User 区（EPC 保持不变）。")
+        tip = QLabel("需先在“采集”页开始采集。选中标签后输入新的 EPC（2~30 字节 HEX），写入标签 EPC 区，写入成功后标签 EPC 会被替换。")
         tip.setWordWrap(True)
         layout.addWidget(tip)
 
@@ -216,13 +216,14 @@ class MainWindow(QMainWindow):
         self.write_epc_edit = QLineEdit()
         self.write_epc_edit.setPlaceholderText("E2 00 34 12 AA BB CC DD")
         self.write_epc_edit.textChanged.connect(self._update_write_button)
-        form.addRow("写入数据", self.write_epc_edit)
+        form.addRow("新 EPC", self.write_epc_edit)
         layout.addLayout(form)
 
         hints = QLabel(
-            "数据写入标签 User 区（SA=0x0000，从头部开始覆盖），EPC 保持不变。\n"
-            "每个字节两位十六进制、空格分隔，长度 2~64 字节且为偶数。\n"
-            "User 区容量不足返回 0xB3，已锁定返回 0xB4。\n"
+            "写入标签 EPC 区（MemBank=0x01，从 word1 写入 PC + 新 EPC），标签 EPC 会被替换。\n"
+            "每个字节两位十六进制、空格分隔，长度 2~30 字节且为偶数。\n"
+            "PC 按新 EPC 长度自动计算，CRC 由标签自动更新。\n"
+            "EPC 区容量不足或长度超过标签支持范围返回 0xB3，已锁定返回 0xB4。\n"
             "Access Password 固定 00000000（不发送 Access 指令）。"
         )
         hints.setWordWrap(True)
@@ -374,7 +375,6 @@ class MainWindow(QMainWindow):
             self.url_edit.text().strip(),
             device_id=self.device_edit.text().strip(),
             on_log=self._bridge.log.emit,
-            get_user=self._reader.get_user if self._reader is not None else None,
         )
         self._uploader.start()
 
@@ -422,13 +422,13 @@ class MainWindow(QMainWindow):
         else:
             self.write_selection_label.setText(f"当前选择：{epc}")
             try:
-                data = protocol.prepare_data_write(self.write_epc_edit.text())
+                data = protocol.prepare_epc_write(self.write_epc_edit.text())
             except ValueError as exc:
                 self.write_hint.setText(str(exc))
                 ok = False
             else:
                 self.write_hint.setText(
-                    f"输入合法：{len(data)} 字节（写入 User 区 SA=0，EPC 不变）"
+                    f"输入合法：{len(data)} 字节，写入后 EPC 将变为 {data.hex().upper()}"
                 )
                 ok = True
         self.write_btn.setEnabled(ok and self._running and not self._write_busy)
@@ -444,7 +444,7 @@ class MainWindow(QMainWindow):
         if epc is None or self._reader is None or self._write_busy:
             return
         try:
-            data = protocol.prepare_data_write(self.write_epc_edit.text())
+            data = protocol.prepare_epc_write(self.write_epc_edit.text())
         except ValueError as exc:
             self.write_result.setPlainText(f"输入无效：{exc}")
             return
@@ -454,20 +454,32 @@ class MainWindow(QMainWindow):
         self._write_busy = True
         self.write_result.setPlainText(f"已提交：{epc} → {data.hex().upper()}，等待结果…")
         self._update_write_button()
-        self._append_log(f"提交写入：{epc} → {data.hex().upper()}")
+        self._append_log(f"提交写入 EPC：{epc} → {data.hex().upper()}")
+
+    def _replace_epc_row(self, old_epc: str, new_epc: str) -> None:
+        for row in range(self.unique_table.rowCount()):
+            item = self.unique_table.item(row, 0)
+            if item is not None and item.text() == old_epc:
+                item.setText(new_epc)
+                if self._is_selected_row(row):
+                    self.write_selection_label.setText(f"当前选择：{new_epc}")
+                return
 
     def _on_write_result(self, result: dict) -> None:
         self._write_busy = False
         lines = [
             f"结果：{'成功' if result['ok'] else '失败'}",
             f"说明：{result['message']}",
-            f"尝试次数：{result['attempts']}",
-            f"目标 EPC：{result['epc']}（未改变）",
-            f"写入值：{result['expected']}",
+            f"原 EPC：{result['epc']}",
+            f"新 EPC：{result['new_epc']}",
         ]
+        if result["read_epc"]:
+            lines.append(f"回读 EPC：{result['read_epc']}")
         if result["readbacks"]:
-            lines.append("回读值：" + " / ".join(result["readbacks"]))
+            lines.append("回读数据：" + " / ".join(result["readbacks"]))
         self.write_result.setPlainText("\n".join(lines))
+        if result["ok"]:
+            self._replace_epc_row(result["epc"], result["new_epc"])
         self._append_log(f"写入{'成功' if result['ok'] else '失败'}：{result['message']}")
         self._update_write_button()
 

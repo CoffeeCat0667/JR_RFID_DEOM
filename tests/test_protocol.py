@@ -103,16 +103,16 @@ class WriteProtocolTest(unittest.TestCase):
             "BB000C00130100000020600030751FEB705C5904E3D50D70AD7E",
         )
 
-    def test_build_write_user(self):
-        frame = protocol.build_write_user(bytes.fromhex(NEW_EPC))
+    def test_build_write_epc(self):
+        frame = protocol.build_write_epc(bytes.fromhex(NEW_EPC))
         self.assertEqual(
             frame.hex().upper(),
-            "BB00490015000000000300000006E2003412AABBCCDDEEFF00119B7E",
+            "BB004900170000000001000100073000E2003412AABBCCDDEEFF0011CD7E",
         )
 
-    def test_build_read_user(self):
-        frame = protocol.build_read_user(6)
-        self.assertEqual(frame.hex().upper(), "BB003900090000000003000000064B7E")
+    def test_build_read_epc(self):
+        frame = protocol.build_read_epc(6)
+        self.assertEqual(frame.hex().upper(), "BB003900090000000001000200064B7E")
 
     def test_parse_select_success(self):
         frame = make_frame(protocol.TYPE_RESPONSE, protocol.CMD_SELECT_PARAMS, b"\x00")
@@ -149,21 +149,23 @@ class WriteProtocolTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 protocol.parse_hex_text(text)
 
-    def test_prepare_data_write(self):
+    def test_prepare_epc_write(self):
         self.assertEqual(
-            protocol.prepare_data_write("E2 00 34 12 AA BB CC DD EE FF 00 11"),
+            protocol.prepare_epc_write("E2 00 34 12 AA BB CC DD EE FF 00 11"),
             bytes.fromhex(NEW_EPC),
         )
         self.assertEqual(
-            protocol.prepare_data_write("E2 00 34 12"), bytes.fromhex("E2003412")
+            protocol.prepare_epc_write("E2 00 34 12"), bytes.fromhex("E2003412")
         )
-        self.assertEqual(len(protocol.prepare_data_write("00 " * 64)), 64)
+        self.assertEqual(len(protocol.prepare_epc_write("00 " * 30)), 30)
         with self.assertRaises(ValueError):
-            protocol.prepare_data_write("E2")
+            protocol.prepare_epc_write("E2")
         with self.assertRaises(ValueError):
-            protocol.prepare_data_write("E2 00 34")
+            protocol.prepare_epc_write("E2 00 34")
         with self.assertRaises(ValueError):
-            protocol.prepare_data_write("00 " * 66)
+            protocol.prepare_epc_write("00 " * 32)
+        with self.assertRaises(ValueError):
+            protocol.prepare_epc_write("00 " * 66)
 
     def test_write_error_names(self):
         for code in (0x10, 0x16, 0xB3, 0xB4):

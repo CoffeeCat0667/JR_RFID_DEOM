@@ -62,18 +62,12 @@ class UploaderTest(unittest.TestCase):
         uploader.stop()
         uploader.join(timeout=3)
 
-    def test_posts_deduplicated_epc_with_user(self):
+    def test_posts_deduplicated_epc(self):
         buffer = TagBuffer()
         buffer.add("AA3412", -50)
         buffer.add("AA3412", -45)
         buffer.add("BB7788", -60)
-        users = {"AA3412": "E2003412AABBCCDDEEFF001122334455"}
-        uploader = Uploader(
-            buffer,
-            self.url,
-            on_log=self.logs.append,
-            get_user=lambda epc: users.get(epc, "00" * 16),
-        )
+        uploader = Uploader(buffer, self.url, on_log=self.logs.append)
         uploader.start()
 
         self.assertTrue(self.wait_until(lambda: bool(EchoHandler.received)))
@@ -84,29 +78,9 @@ class UploaderTest(unittest.TestCase):
         self.assertEqual(path, "/api/epc")
         self.assertEqual(content_type, "application/json")
         self.assertEqual(device_id, "RFID-PLATE-001")
-        self.assertEqual(
-            json.loads(body),
-            [
-                {"epc": "AA3412", "user": "E2003412AABBCCDDEEFF001122334455"},
-                {"epc": "BB7788", "user": "00" * 16},
-            ],
-        )
+        self.assertEqual(json.loads(body), ["AA3412", "BB7788"])
         self.assertEqual(uploader.success_batches, 1)
         self.assertEqual(uploader.sent_tags, 2)
-
-    def test_missing_user_getter_sends_zero_user(self):
-        buffer = TagBuffer()
-        buffer.add("AA3412", -50)
-        uploader = Uploader(buffer, self.url)
-        uploader.start()
-
-        self.assertTrue(self.wait_until(lambda: bool(EchoHandler.received)))
-        self.stop(buffer, uploader)
-
-        self.assertEqual(
-            json.loads(EchoHandler.received[0][3]),
-            [{"epc": "AA3412", "user": "00" * 16}],
-        )
 
     def test_custom_device_id_header(self):
         buffer = TagBuffer()

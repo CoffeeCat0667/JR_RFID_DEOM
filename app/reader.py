@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections import deque
 from typing import Callable
 
 import serial
@@ -63,10 +62,6 @@ class Reader(threading.Thread):
         self._last_log: dict[str, float] = {}
         self._write_job: tuple[str, bytes] | None = None
         self._write_lock = threading.Lock()
-        self._user_cache: dict[str, str] = {}
-        self._user_pending: deque[str] = deque()
-        self._user_queued: set[str] = set()
-        self._user_lock = threading.Lock()
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -79,12 +74,6 @@ class Reader(threading.Thread):
                 return False
             self._write_job = (epc, data)
         return True
-
-    def get_user(self, epc: str) -> str:
-        """上报用 User 数据：16 字节大写 HEX，未读到或读取失败时为全 0。"""
-        with self._user_lock:
-            value = self._user_cache.get(epc)
-        return value or protocol.USER_DATA_ZERO
 
     def run(self) -> None:
         try:
@@ -166,11 +155,6 @@ class Reader(threading.Thread):
                 outstanding = None
                 self._log_throttled("poll-timeout", "轮询响应超时，继续下一轮")
             if outstanding is None:
-                pending_user = self._take_user_read()
-                if pending_user is not None:
-                    self._read_user(pending_user)
-                    next_poll = time.monotonic() + POLL_INTERVAL
-                    continue
                 self._write(protocol.SINGLE_POLL_CMD)
                 self.polls += 1
                 outstanding = now
@@ -211,106 +195,52 @@ class Reader(threading.Thread):
                 self.writing = True
         return job
 
-    def _queue_user_read(self, epc: str) -> None:
-        with self._user_lock:
-            if epc in self._user_cache or epc in self._user_queued:
-                return
-            self._user_queued.add(epc)
-            self._user_pending.append(epc)
-
-    def _take_user_read(self) -> str | None:
-        with self._user_lock:
-            while self._user_pending:
-                epc = self._user_pending.popleft()
-                self._user_queued.discard(epc)
-                if epc not in self._user_cache:
-                    return epc
-        return None
-
-    def _set_user(self, epc: str, data: bytes) -> None:
-        value = (
-            data[: protocol.USER_DATA_LEN]
-            .ljust(protocol.USER_DATA_LEN, b"\x00")
-            .hex()
-            .upper()
-        )
-        with self._user_lock:
-            self._user_cache[epc] = value
-
-    def _read_user(self, epc: str) -> None:
-        select_ok, message = self._select_mask(epc)
-        if select_ok:
-            read_ok, actual, read_epc, message = self._read_data(protocol.USER_DATA_WORDS)
-            if read_ok and read_epc == epc:
-                self._set_user(epc, actual)
-                return
-            if read_ok:
-                message = "回读 EPC 与所选不一致"
-        self._set_user(epc, b"")
-        self._log(f"读取标签 User 区失败，上报按 16 字节 0 处理：{epc}（{message}）")
-
     def _run_write_job(self, epc: str, data: bytes) -> None:
         self._emit(self.on_write_state, True)
         expected = data.hex().upper()
         readbacks: list[str] = []
-        attempts = 0
+        read_epc: str | None = None
         ok = False
         message = "写入失败"
-        epc_mismatch = False
         try:
-            attempts = 1
             select_ok, message = self._select_mask(epc)
             if select_ok:
-                write_ok, message = self._write_data(data)
+                write_ok, message = self._write_epc(data)
                 if write_ok:
-                    read_ok, actual, read_epc, message = self._read_data(len(data) // 2)
-                    if read_ok:
-                        readbacks.append(actual.hex().upper())
-                        if read_epc != epc:
-                            epc_mismatch = True
-                            message = "回读标签 EPC 与所选不一致，已停止写入"
-                        elif actual == data:
-                            ok = True
-                            message = "写入成功，回读一致"
-                        else:
-                            message = "回读数据与写入值不一致"
+                    # EPC 已被改写，必须用新 EPC 重新 Select 才能回读
+                    select_new_ok, select_message = self._select_mask(expected)
+                    if not select_new_ok:
+                        message = f"写入已返回成功，但无法用新 EPC 选中标签（{select_message}）"
                     else:
-                        message += "，无法确认写入结果"
-
-            if not ok and readbacks and not epc_mismatch:
-                attempts = 2
-                write_ok, message = self._write_data(data)
-                if write_ok:
-                    read_ok, actual, read_epc, message = self._read_data(len(data) // 2)
-                    if read_ok:
-                        readbacks.append(actual.hex().upper())
-                        if read_epc != epc:
-                            message = "回读标签 EPC 与所选不一致，已停止写入"
-                        elif actual == data:
-                            ok = True
-                            message = "写入成功，回读一致"
+                        read_ok, actual, read_epc, message = self._read_epc(len(data) // 2)
+                        if read_ok:
+                            readbacks.append(actual.hex().upper())
+                            if read_epc == expected and actual == data:
+                                ok = True
+                                message = "写入成功，回读一致"
+                            elif read_epc != expected:
+                                message = "回读 EPC 与写入值不一致"
+                            else:
+                                message = "回读数据与写入值不一致"
                         else:
-                            message = "回读不一致，自动重写一次后仍不一致"
-                    else:
-                        message += "，无法确认写入结果"
+                            message += "，无法确认写入结果"
         except ValueError as exc:
             message = f"写入参数无效：{exc}"
         finally:
             with self._write_lock:
                 self.writing = False
-            if ok:
-                self._set_user(epc, data)
             self._emit(self.on_write_state, False)
             self._emit(
                 self.on_write_result,
                 {
                     "ok": ok,
                     "message": message,
-                    "attempts": attempts,
                     "expected": expected,
                     "actual": readbacks[-1] if readbacks else None,
                     "readbacks": readbacks,
                     "epc": epc,
+                    "new_epc": expected,
+                    "read_epc": read_epc,
                 },
             )
 
@@ -326,8 +256,8 @@ class Reader(threading.Thread):
             return False, "设置 Select 参数失败"
         return True, ""
 
-    def _write_data(self, data: bytes) -> tuple[bool, str]:
-        frame = self._command(protocol.build_write_user(data), protocol.CMD_WRITE)
+    def _write_epc(self, epc: bytes) -> tuple[bool, str]:
+        frame = self._command(protocol.build_write_epc(epc), protocol.CMD_WRITE)
         if frame is None:
             return False, "写标签超时"
         if frame.command == protocol.CMD_ERROR:
@@ -336,8 +266,8 @@ class Reader(threading.Thread):
             return False, "写入返回失败"
         return True, ""
 
-    def _read_data(self, words: int) -> tuple[bool, bytes, str | None, str]:
-        frame = self._command(protocol.build_read_user(words), protocol.CMD_READ)
+    def _read_epc(self, words: int) -> tuple[bool, bytes, str | None, str]:
+        frame = self._command(protocol.build_read_epc(words), protocol.CMD_READ)
         if frame is None:
             return False, b"", None, "回读超时"
         if frame.command == protocol.CMD_ERROR:
@@ -373,7 +303,6 @@ class Reader(threading.Thread):
         if tag.pc_mismatch:
             self._log_throttled("pc-mismatch", f"EPC 长度与 PC 不一致（{tag.epc}），已按帧长度处理")
         self._buffer.add(tag.epc, tag.rssi)
-        self._queue_user_read(tag.epc)
         self._emit(self.on_tag, tag.epc, tag.rssi)
 
     def _read_frames(self) -> list[protocol.Frame]:

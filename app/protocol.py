@@ -18,13 +18,13 @@ CMD_READ = 0x39
 CMD_WRITE = 0x49
 CMD_ERROR = 0xFF
 
-MEM_BANK_USER = 0x03
+MEM_BANK_EPC = 0x01
 MAX_EPC_MASK_LEN = 31
+MAX_WRITE_EPC_LEN = 30
 
-# 上报固定携带的 User 区长度（字节）与对应读取字数。
-USER_DATA_LEN = 16
-USER_DATA_WORDS = USER_DATA_LEN // 2
-USER_DATA_ZERO = "00" * USER_DATA_LEN
+# EPC 区布局：word0 为 CRC（标签在写入 EPC 后自动更新），word1 为 PC，word2 起为 EPC。
+EPC_SA_PC = 0x0001
+EPC_SA_DATA = 0x0002
 
 # 协议中所有已定义帧的参数长度都远小于该值，用于从垃圾字节中重新同步。
 MAX_PARAM_LEN = 256
@@ -65,28 +65,30 @@ def build_select_params(epc: bytes) -> bytes:
     return build_frame(TYPE_COMMAND, CMD_SELECT_PARAMS, param)
 
 
-def build_write_user(data: bytes, access_password: int = 0) -> bytes:
-    """4.8 写标签数据存储区：User 区从 SA=0 开始。"""
-    if len(data) < 2 or len(data) > 64 or len(data) % 2:
-        raise ValueError("写入数据必须为 2~64 字节且按 word 对齐")
+def build_write_epc(epc: bytes, access_password: int = 0) -> bytes:
+    """4.8 写标签数据存储区：从 EPC 区 word1 写入 PC + 新 EPC。"""
+    if len(epc) < 2 or len(epc) > MAX_WRITE_EPC_LEN or len(epc) % 2:
+        raise ValueError("EPC 长度必须为 2~30 字节的偶数")
+    pc = (len(epc) // 2) << 11
+    data = pc.to_bytes(2, "big") + epc
     param = (
         access_password.to_bytes(4, "big")
-        + bytes([MEM_BANK_USER])
-        + b"\x00\x00"
+        + bytes([MEM_BANK_EPC])
+        + EPC_SA_PC.to_bytes(2, "big")
         + (len(data) // 2).to_bytes(2, "big")
         + data
     )
     return build_frame(TYPE_COMMAND, CMD_WRITE, param)
 
 
-def build_read_user(words: int, access_password: int = 0) -> bytes:
-    """4.7 读标签数据存储区：User 区从 SA=0 开始。"""
+def build_read_epc(words: int, access_password: int = 0) -> bytes:
+    """4.7 读标签数据存储区：从 EPC 区 word2 读取 EPC，用于回读校验。"""
     if words < 1 or words > 32:
         raise ValueError("读取长度必须为 1~32 word")
     param = (
         access_password.to_bytes(4, "big")
-        + bytes([MEM_BANK_USER])
-        + b"\x00\x00"
+        + bytes([MEM_BANK_EPC])
+        + EPC_SA_DATA.to_bytes(2, "big")
         + words.to_bytes(2, "big")
     )
     return build_frame(TYPE_COMMAND, CMD_READ, param)
@@ -247,11 +249,13 @@ def parse_hex_text(text: str) -> bytes:
     return bytes(data)
 
 
-def prepare_data_write(text: str) -> bytes:
-    """校验写入 User 区的数据：2~64 字节且按 word 对齐。"""
+def prepare_epc_write(text: str) -> bytes:
+    """校验要写入 EPC 区的 EPC：2~30 字节且按 word 对齐。"""
     data = parse_hex_text(text)
+    if len(data) > MAX_WRITE_EPC_LEN:
+        raise ValueError("EPC 长度必须为 2~30 字节")
     if len(data) % 2:
-        raise ValueError("写入数据必须按 word（2 字节）对齐")
+        raise ValueError("EPC 必须按 word（2 字节）对齐")
     return data
 
 

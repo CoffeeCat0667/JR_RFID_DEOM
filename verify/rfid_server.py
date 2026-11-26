@@ -4,7 +4,7 @@
     python verify/rfid_server.py [端口]      # 默认 8000
 
 接口：
-    POST /api/epc   请求体为对象数组，例如 [{"epc":"E200...","user":"0000..."}]
+    POST /api/epc   请求体为 EPC 字符串数组，例如 ["E200...","3075..."]
     GET  /api/data  当前统计数据（JSON）
     GET  /          可视化页面（每秒自动刷新）
 """
@@ -200,30 +200,10 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._json({"ok": False, "error": f"invalid json: {exc}"}, status=400)
             return
-        if not isinstance(data, list):
-            self._json(
-                {"ok": False, "error": "body must be a JSON array of objects"},
-                status=400,
-            )
+        if not isinstance(data, list) or not all(isinstance(item, str) for item in data):
+            self._json({"ok": False, "error": "body must be a JSON array of strings"}, status=400)
             return
-        epcs: list[str] = []
-        for item in data:
-            if not isinstance(item, dict):
-                self._json(
-                    {"ok": False, "error": "each item must be an object with epc/user"},
-                    status=400,
-                )
-                return
-            epc = item.get("epc")
-            user = item.get("user", "")
-            if not isinstance(epc, str) or not isinstance(user, str):
-                self._json(
-                    {"ok": False, "error": "epc and user must be strings"},
-                    status=400,
-                )
-                return
-            if epc.strip():
-                epcs.append(epc.strip().upper())
+        epcs = [item.strip().upper() for item in data if item.strip()]
         if not epcs:
             self._json({"ok": False, "error": "empty array"}, status=400)
             return

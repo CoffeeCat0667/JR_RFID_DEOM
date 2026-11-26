@@ -1,6 +1,6 @@
 # PLAN.md
 
-- 状态：基础版本（v1）与“写入页”已实现并打包；2026-11-16 修订：写入页改为写标签 User 区数据（EPC 保持不变），HTTP 上报按 `docs/RFID检测板对接协议.md` 适配。
+- 状态：基础版本（v1）与“写入页”已实现并打包；2026-11-16 修订：写入页改为写标签 User 区数据（EPC 保持不变），HTTP 上报按 `docs/RFID检测板对接协议.md` 适配。2026-11-26 修订：回退 User 区读写，写入页改为写 EPC 区，HTTP 恢复 EPC 字符串数组（见 §3C）。
 - 最后更新：2026-11-16
 - 开发规范：见 `AGENTS.md`（最高优先级，未授权功能一律不做）。
 
@@ -24,7 +24,7 @@
 | 帧解析 | 按 PL 长度切帧，不依赖帧尾搜索；校验和 `sum(Type..最后参数) & 0xFF` |
 | EPC 解析 | `RSSI(1) + PC(2) + EPC(PL-5) + CRC(2)`，EPC 大写十六进制 |
 | 缓冲区 | 线程安全；批内按 EPC 去重；上限 5000 条 |
-| HTTP | `POST` + `application/json`，请求体见 §3A（EPC + User 对象数组）；失败重试 3 次后回填 |
+| HTTP | `POST` + `application/json`，请求体为 EPC 字符串数组；失败重试 3 次后回填 |
 | 界面 | 串口/波特率/地址选择、状态与统计、最近标签表、日志 |
 | 日志/配置 | `%LOCALAPPDATA%\JRRFID\logs\`、`%LOCALAPPDATA%\JRRFID\config.json` |
 | 验证服务器 | `verify\rfid_server.py`，单文件标准库实现，Web 可视化 |
@@ -35,6 +35,8 @@
 ---
 
 ## 3. 新增功能：写入页
+
+> 2026-11-26：本节的 User 区写入方案已回退，当前写入页写 EPC 区，见 §3C。
 
 ### 3.1 需求
 
@@ -264,6 +266,8 @@ Read：  BB 00 39 00 09 00 00 00 00 03 00 00 00 04 <CK> 7E
 
 ### 3A.1 EPC + User 数据上报
 
+> 2026-11-26：本节方案已回退，HTTP 恢复 EPC 字符串数组，见 §3C。
+
 | 项 | 决定 |
 |---|---|
 | 上报内容 | 每条为一个对象 `{"epc": "<EPC>", "user": "<16 字节 User>"}` |
@@ -305,10 +309,84 @@ Read：  BB 00 39 00 09 00 00 00 00 03 00 00 00 04 <CK> 7E
 
 ---
 
+## 3C. 2026-11-26 修订：回退 User 区，写入页改为写 EPC
+
+### 3C.1 已确认决策
+
+| 项 | 决定 |
+|---|---|
+| HTTP 上报 | 恢复为 EPC 字符串数组 `["EPC1", "EPC2"]`；删除 Reader 的 User 读取与缓存 |
+| 写入目标 | 标签 **EPC 存储区**（`MemBank=0x01`）；不再写 User 区 |
+| 写入内容 | 从 `SA=0x0001` 写入 `PC + 新 EPC`；PC 高 5 位按新 EPC 字数计算，其余标志位为 0 |
+| CRC | EPC 区 word0 的 CRC 由标签在写入 EPC 后自动更新，程序不写 CRC |
+| 数据长度 | 新 EPC 为 **2~30 字节且为偶数**（同时受 Select 掩码与 `0x49` 单次 32 word 上限约束） |
+| 回读 | 写完后用新 EPC 重新 Select，`0x39` 读 EPC 区 `SA=0x0002`，EPC 与数据都一致才算成功 |
+| 失败处理 | 写错误、回读超时、回读不一致均直接失败，**不自动重写**（旧 EPC 可能已不存在，避免误写其它标签） |
+| 成功后界面 | 写入页表格中该行 EPC 替换为新值；采集页与缓冲区中的旧 EPC 不做历史回改 |
+| Access Password | 固定 `00000000`，不发送 Access 指令 |
+
+### 3C.2 命令时序
+
+```text
+等待当前轮询响应结束（或 250ms 超时）
+  ↓
+1) 0x0C Select：Mask = 旧 EPC
+2) 0x49 写：MemBank=01，SA=0001，DL=(2+N)/2，DT=PC + 新 EPC
+3) 0x0C Select：Mask = 新 EPC（EPC 已改变，必须重新选中）
+4) 0x39 读：MemBank=01，SA=0002，DL=N/2
+5) 回读 EPC == 新 EPC 且回读数据 == 新 EPC ？
+     是 → 成功
+     否 → 失败（不重写）
+  ↓
+恢复 100ms 轮询
+```
+
+### 3C.3 帧构造
+
+**写 EPC 区（0x49）**
+
+```
+Param = AP(00 00 00 00) + MemBank(01) + SA(00 01) + DL(1 + N/2) + PC + EPC
+PC    = (N/2) << 11
+```
+
+示例：把标签 EPC 改为 `E2 00 34 12 AA BB CC DD`（8 字节，4 word）：
+
+```
+PC = 0x2000
+DT = 20 00 E2 00 34 12 AA BB CC DD
+DL = 5
+```
+
+**读 EPC 区（0x39）**
+
+```
+Param = AP(00 00 00 00) + MemBank(01) + SA(00 02) + DL(N/2)
+```
+
+### 3C.4 代码改动点
+
+| 文件 | 改动 |
+|---|---|
+| `app/protocol.py` | 删除 User 常量与组帧；新增 `MEM_BANK_EPC`、`EPC_SA_PC`、`EPC_SA_DATA`、`build_write_epc`、`build_read_epc`、`prepare_epc_write` |
+| `app/reader.py` | 删除 User 缓存与读取；写入任务改为 Select 旧 EPC → 写 PC+新 EPC → Select 新 EPC → 回读 |
+| `app/uploader.py` | 请求体恢复 EPC 字符串数组，删除 `get_user` |
+| `app/ui/main_window.py` | 写入页文案与校验改为新 EPC；成功后替换表格中的 EPC 行 |
+| `tests/test_protocol.py` | EPC 区写/读组帧与 EPC 长度校验 |
+| `tests/test_uploader.py` | 断言 EPC 字符串数组 |
+| `tests/test_writer.py` | 假串口改为 EPC 区模型；覆盖成功、PC 重算、写错误、回读超时、回读不一致；断言采集不访问 User 区 |
+| `README.md` | 上报格式、写入页与测试说明同步回退 |
+| `verify/rfid_server.py` | 恢复只接受 EPC 字符串数组 |
+| `RFID采集上传与写入逻辑.md` | 按本修订重写采集/上报/写入链路 |
+
+不改动：2 秒静默聚合、批内去重、缓冲区结构、HTTP 重试与丢弃规则。
+
+---
+
 ## 4. 部署与文档
 
 - 实现完成后重新运行 `build.bat`，覆盖 `dist\RFID_EPC_Uploader.exe`。
-- README 补充：写入页 User 区写入规则（SA=0、2~64 字节偶数、EPC 不变）、AP 固定值、错误码说明；HTTP 请求头、`ok` 判定、重试与 2 秒聚合。
+- README 补充：写入页改为 EPC 区写入（2~30 字节偶数、PC 自动计算、CRC 由标签更新）、HTTP EPC 字符串数组、请求头、`ok` 判定、重试与 2 秒聚合。
 - 版本仍为单文件 exe，无新增第三方依赖。
 
 ---
