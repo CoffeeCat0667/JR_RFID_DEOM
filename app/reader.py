@@ -19,6 +19,8 @@ HANDSHAKE_RETRIES = 3
 POLL_TIMEOUT = 0.25
 SERIAL_TIMEOUT = 0.02
 COMMAND_TIMEOUT = 1.0
+TID_COMMAND_TIMEOUT = 0.3
+TID_RETRY_INTERVAL = 3.0
 
 logger = logging.getLogger("rfid")
 
@@ -68,6 +70,7 @@ class Reader(threading.Thread):
         self._tid_cache: dict[str, str] = {}
         self._tid_pending: deque[str] = deque()
         self._tid_queued: set[str] = set()
+        self._tid_retry_at: dict[str, float] = {}
         self._tid_lock = threading.Lock()
 
     def stop(self) -> None:
@@ -214,7 +217,11 @@ class Reader(threading.Thread):
 
     def _queue_tid_read(self, epc: str) -> None:
         with self._tid_lock:
-            if epc in self._tid_cache or epc in self._tid_queued:
+            if self._tid_cache.get(epc):
+                return
+            if epc in self._tid_queued:
+                return
+            if epc in self._tid_cache and time.monotonic() < self._tid_retry_at.get(epc, 0.0):
                 return
             self._tid_queued.add(epc)
             self._tid_pending.append(epc)
@@ -224,13 +231,14 @@ class Reader(threading.Thread):
             while self._tid_pending:
                 epc = self._tid_pending.popleft()
                 self._tid_queued.discard(epc)
-                if epc not in self._tid_cache:
+                if not self._tid_cache.get(epc):
                     return epc
         return None
 
     def _set_tid(self, epc: str, data: bytes) -> None:
         with self._tid_lock:
             self._tid_cache[epc] = data.hex().upper()
+            self._tid_retry_at.pop(epc, None)
 
     def _read_tid(self, epc: str) -> None:
         select_ok, message = self._select_mask(epc)
@@ -238,16 +246,23 @@ class Reader(threading.Thread):
             for words in protocol.TID_READ_WORDS:
                 read_ok, actual, read_epc, message = self._read_tid_data(words)
                 if read_ok and read_epc == epc:
+                    tid_hex = actual.hex().upper()
                     self._set_tid(epc, actual)
-                    self._log(f"TID：{epc} → {actual.hex().upper()}")
+                    self._log(f"TID：{epc} → {tid_hex}")
+                    self._emit(self.on_tid, epc, tid_hex)
                     return
                 if read_ok:
                     message = "回读 EPC 与所选不一致"
                     break
                 if "0xA3" not in message:
                     break
+        with self._tid_lock:
+            first_fail = epc not in self._tid_cache
         self._set_tid(epc, b"")
-        self._log(f"读取标签 TID 失败，界面按空值处理：{epc}（{message}）")
+        with self._tid_lock:
+            self._tid_retry_at[epc] = time.monotonic() + TID_RETRY_INTERVAL
+        if first_fail:
+            self._log(f"读取标签 TID 失败，{TID_RETRY_INTERVAL:.0f} 秒后重试：{epc}（{message}）")
 
     def _run_write_job(self, epc: str, data: bytes) -> None:
         self._emit(self.on_write_state, True)
@@ -338,7 +353,9 @@ class Reader(threading.Thread):
         return True, data, read_epc, ""
 
     def _read_tid_data(self, words: int) -> tuple[bool, bytes, str | None, str]:
-        frame = self._command(protocol.build_read_tid(words), protocol.CMD_READ)
+        frame = self._command(
+            protocol.build_read_tid(words), protocol.CMD_READ, TID_COMMAND_TIMEOUT
+        )
         if frame is None:
             return False, b"", None, "回读超时"
         if frame.command == protocol.CMD_ERROR:
@@ -355,12 +372,18 @@ class Reader(threading.Thread):
             return "标签返回错误"
         return f"标签返回错误：{protocol.error_name(error.code)}（0x{error.code:02X}）"
 
-    def _command(self, frame: bytes, command: int) -> protocol.Frame | None:
+    def _command(
+        self, frame: bytes, command: int, timeout: float | None = None
+    ) -> protocol.Frame | None:
         self._write(frame)
-        return self._wait_response(command)
+        return self._wait_response(command, timeout)
 
-    def _wait_response(self, command: int) -> protocol.Frame | None:
-        deadline = time.monotonic() + COMMAND_TIMEOUT
+    def _wait_response(
+        self, command: int, timeout: float | None = None
+    ) -> protocol.Frame | None:
+        if timeout is None:
+            timeout = COMMAND_TIMEOUT
+        deadline = time.monotonic() + timeout
         while not self._stop_event.is_set() and time.monotonic() < deadline:
             for frame in self._read_frames():
                 if frame.frame_type != protocol.TYPE_RESPONSE:

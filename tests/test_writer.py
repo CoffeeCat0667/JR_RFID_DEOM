@@ -253,12 +253,18 @@ class WriterJobTest(unittest.TestCase):
 class WriterLoopTest(unittest.TestCase):
     def setUp(self):
         self._saved_timeout = reader_mod.COMMAND_TIMEOUT
+        self._saved_tid_timeout = reader_mod.TID_COMMAND_TIMEOUT
+        self._saved_tid_retry = reader_mod.TID_RETRY_INTERVAL
         self._saved_serial = reader_mod.serial.Serial
         reader_mod.COMMAND_TIMEOUT = 0.2
+        reader_mod.TID_COMMAND_TIMEOUT = 0.1
+        reader_mod.TID_RETRY_INTERVAL = 0.3
         reader_mod.serial.Serial = FakeSerial
 
     def tearDown(self):
         reader_mod.COMMAND_TIMEOUT = self._saved_timeout
+        reader_mod.TID_COMMAND_TIMEOUT = self._saved_tid_timeout
+        reader_mod.TID_RETRY_INTERVAL = self._saved_tid_retry
         reader_mod.serial.Serial = self._saved_serial
 
     def wait_for(self, predicate, timeout=3.0):
@@ -298,22 +304,45 @@ class WriterLoopTest(unittest.TestCase):
         reader.stop()
         reader.join(timeout=3)
 
-    def test_tid_read_failure_caches_empty_once(self):
-        reader = Reader("COM1", 115200, TagBuffer())
+    def test_tid_read_failure_retries_until_success(self):
+        events: list[tuple[str, str]] = []
+        reader = Reader(
+            "COM1",
+            115200,
+            TagBuffer(),
+            on_tid=lambda epc, tid: events.append((epc, tid)),
+        )
         reader.start()
         self.assertTrue(self.wait_for(lambda: bool(reader.version)))
         fake = FakeSerial.last
         fake.tid = bytearray()
         fake.poll_tag = OLD_EPC
 
+        # 第一次失败：8/6/4/2 word 全部越界
         self.assertTrue(
             self.wait_for(
                 lambda: len(self._read_banks(fake)) == len(protocol.TID_READ_WORDS)
             )
         )
-        time.sleep(0.3)
-        self.assertEqual(len(self._read_banks(fake)), len(protocol.TID_READ_WORDS))
         self.assertEqual(reader.get_tid(OLD_EPC), "")
+
+        # 3 秒（测试中缩短为 0.3 秒）后自动重试
+        self.assertTrue(
+            self.wait_for(
+                lambda: len(self._read_banks(fake)) == 2 * len(protocol.TID_READ_WORDS)
+            )
+        )
+        self.assertEqual(reader.get_tid(OLD_EPC), "")
+
+        # 标签拿近后，下一次重试成功
+        fake.tid = bytearray(TID)
+        self.assertTrue(self.wait_for(lambda: reader.get_tid(OLD_EPC) == TID_HEX))
+        self.assertEqual(events, [(OLD_EPC, TID_HEX)])
+
+        # 成功之后不再重复读
+        reads = len(self._read_banks(fake))
+        time.sleep(0.5)
+        self.assertEqual(len(self._read_banks(fake)), reads)
 
         reader.stop()
         reader.join(timeout=3)

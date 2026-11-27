@@ -500,8 +500,9 @@ TID 只用于界面显示，**不进入 HTTP 上报**。策略是“首次识别
 - 轮询第一次识别到某个唯一 EPC 时，把它放入待读队列。
 - 在没有在途轮询时，执行 `0x0C Select` + `0x39 读 TID`（`MemBank=0x02`、`SA=0`）。
 - TID 长度因标签而异：依次尝试 `DL=8/6/4/2 word`，取第一个成功的实际长度，不补齐。
-- 读取失败（超时、`0xA3` 存储区越界、回读 EPC 不一致）→ 该 EPC 缓存空字符串，界面显示 `—`。
-- 同一次采集运行内同一 EPC 只读一次；停止采集后缓存随 `Reader` 丢弃。
+- 读取失败（超时、`0xA3` 存储区越界、回读 EPC 不一致）→ 该 EPC 缓存空字符串，界面显示 `—`，并记录重试时间；此后**每 3 秒重试一次**，单次 TID 命令最多等 0.3 秒。
+- 成功后同一 EPC 不再读取；失败则按 3 秒间隔持续重试（仅在该 EPC 仍被轮询到时），直到成功或停止采集。
+- 物理限制：TID 读取需要标签接收 Read 命令并访问存储区，可靠距离通常小于 EPC 盘存；远距离读不到 TID 属正常，拿近后会自动补读。
 - 写入页成功改写 EPC 后，把 TID 缓存从旧 EPC 移到新 EPC。
 
 协议常量与组帧（`app/protocol.py`）：
@@ -530,6 +531,7 @@ def build_read_tid(words: int, access_password: int = 0) -> bytes:
 self._tid_cache: dict[str, str] = {}
 self._tid_pending: deque[str] = deque()
 self._tid_queued: set[str] = set()
+self._tid_retry_at: dict[str, float] = {}
 self._tid_lock = threading.Lock()
 
 
@@ -541,7 +543,11 @@ def get_tid(self, epc: str) -> str:
 
 def _queue_tid_read(self, epc: str) -> None:
     with self._tid_lock:
-        if epc in self._tid_cache or epc in self._tid_queued:
+        if self._tid_cache.get(epc):
+            return
+        if epc in self._tid_queued:
+            return
+        if epc in self._tid_cache and time.monotonic() < self._tid_retry_at.get(epc, 0.0):
             return
         self._tid_queued.add(epc)
         self._tid_pending.append(epc)
@@ -552,7 +558,7 @@ def _take_tid_read(self) -> str | None:
         while self._tid_pending:
             epc = self._tid_pending.popleft()
             self._tid_queued.discard(epc)
-            if epc not in self._tid_cache:
+            if not self._tid_cache.get(epc):
                 return epc
     return None
 
@@ -560,6 +566,7 @@ def _take_tid_read(self) -> str | None:
 def _set_tid(self, epc: str, data: bytes) -> None:
     with self._tid_lock:
         self._tid_cache[epc] = data.hex().upper()
+        self._tid_retry_at.pop(epc, None)
 
 
 def _read_tid(self, epc: str) -> None:
@@ -568,16 +575,23 @@ def _read_tid(self, epc: str) -> None:
         for words in protocol.TID_READ_WORDS:
             read_ok, actual, read_epc, message = self._read_tid_data(words)
             if read_ok and read_epc == epc:
+                tid_hex = actual.hex().upper()
                 self._set_tid(epc, actual)
-                self._log(f"TID：{epc} → {actual.hex().upper()}")
+                self._log(f"TID：{epc} → {tid_hex}")
+                self._emit(self.on_tid, epc, tid_hex)
                 return
             if read_ok:
                 message = "回读 EPC 与所选不一致"
                 break
             if "0xA3" not in message:
                 break
+    with self._tid_lock:
+        first_fail = epc not in self._tid_cache
     self._set_tid(epc, b"")
-    self._log(f"读取标签 TID 失败，界面按空值处理：{epc}（{message}）")
+    with self._tid_lock:
+        self._tid_retry_at[epc] = time.monotonic() + TID_RETRY_INTERVAL
+    if first_fail:
+        self._log(f"读取标签 TID 失败，{TID_RETRY_INTERVAL:.0f} 秒后重试：{epc}（{message}）")
 ```
 
 轮询循环中的调度（在无在途轮询、且没有待执行写入任务时执行一次）：
@@ -595,8 +609,9 @@ if outstanding is None:
 要点：
 
 - 读 TID 放在轮询超时处理之后、发送下一条轮询之前，避免因“通知帧不清除在途标记”而一直得不到执行。
-- `0xA3` 表示请求长度超过标签 TID 区容量，程序自动缩短长度重试；其它错误或超时直接放弃。
+- `0xA3` 表示请求长度超过标签 TID 区容量，程序自动缩短长度重试；其它错误或超时直接结束本次尝试。
 - 一次 TID 读取通常需要 1~2 条 `0x39` 命令（12 字节 TID 先读 8 word 失败，再读 6 word 成功）。
+- 失败后不永久放弃：`TID_RETRY_INTERVAL = 3.0` 秒后再次排队；`TID_COMMAND_TIMEOUT = 0.3` 秒限制单次命令等待，避免远距离标签长时间占用轮询。
 
 ### 4.7 缓冲区（`app/buffer.py`）
 
@@ -1361,6 +1376,8 @@ def _on_write_result(self, result: dict) -> None:
 | `MAX_WRITE_EPC_LEN` | 30 字节 | `protocol.py` | 新 EPC 上限 |
 | `MAX_EPC_MASK_LEN` | 31 字节 | `protocol.py` | Select 掩码字节上限 |
 | `TID_READ_WORDS` | `(8, 6, 4, 2)` | `protocol.py` | TID 自适应读取长度 |
+| `TID_COMMAND_TIMEOUT` | 0.3s | `reader.py` | 单次 TID 命令等待上限 |
+| `TID_RETRY_INTERVAL` | 3.0s | `reader.py` | TID 读取失败后的重试间隔 |
 
 ### 9.4 界面
 
@@ -1503,8 +1520,9 @@ python verify\rfid_server_TID.py 8000
 15. **HTTP 协议**：当前请求体是 EPC 字符串数组，与 `docs/RFID检测板对接协议.md` 一致；若 MES 改为对象格式，需要同步修改 `Uploader.run()`。
 16. **TID 仅本地显示**：TID 不进入 HTTP 上报；如需上报，需同步修改 `Uploader` 与验证服务器。
 17. **TID 读取有额外开销**：每个新 EPC 首次识别时多 1~2 条 `0x39` 命令（12 字节 TID 为 8 word 失败 + 6 word 成功），期间暂停一次轮询。
-18. **TID 读取失败不重试**：超时、无 TID 区或回读 EPC 不一致时缓存空值，界面显示 `—`，后续不再重读。
+18. **TID 读取失败会自动重试**：每 3 秒重试一次，单次最多等 0.3 秒；远距离反复失败时仍会周期性占用少量轮询时间，拿近后会自动补读成功。
 19. **TID 长度按实际返回**：依次尝试 8/6/4/2 word，不补齐；超过 8 word（16 字节）的 TID 会被截断为 16 字节。
+20. **TID 读取距离小于 EPC 盘存距离**：TID 读取需要标签接收并执行 Read 命令，远距离读不到 TID 属正常现象；EPC 仍可正常采集与上报。
 
 ---
 

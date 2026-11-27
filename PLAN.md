@@ -391,8 +391,8 @@ Param = AP(00 00 00 00) + MemBank(01) + SA(00 02) + DL(N/2)
 |---|---|
 | 读取内容 | 保留原有 EPC 轮询；首次识别到新的唯一 EPC 时额外读取 TID |
 | TID 长度 | 依次尝试 8/6/4/2 word，取第一个读取成功的实际长度；不补齐 |
-| 读取失败 | 超时、`0xA3` 存储区越界、回读 EPC 不一致 → 该 EPC 缓存空值，界面显示 `—`，不阻塞采集与上报 |
-| 重复读取 | 同一次采集运行内同一 EPC 只读一次；停止采集后缓存随 Reader 丢弃 |
+| 读取失败 | 超时、`0xA3` 存储区越界、回读 EPC 不一致 → 该 EPC 缓存空值，界面显示 `—`；**每 3 秒自动重试一次**，单次 TID 命令最多等 0.3 秒 |
+| 重复读取 | 成功后同一 EPC 不再读取；失败则每隔 3 秒重试，直到成功或停止采集 |
 | 显示位置 | 采集页“最近标签”、写入页“识别到的标签（唯一）”新增 TID 列 |
 | HTTP 上报 | **不变**：仍为 EPC 字符串数组 |
 | 写 EPC 联动 | 写入成功后把 TID 缓存从旧 EPC 移到新 EPC |
@@ -406,15 +406,17 @@ Param = AP(00 00 00 00) + MemBank(01) + SA(00 02) + DL(N/2)
 
 TID 为 12 字节（96 bit）时，8 word 返回 `0xA3`，随后 6 word 成功；最终显示 24 个 hex 字符。
 
+失败处理：单次 TID 读命令最多等 0.3 秒；失败后记录重试时间，**每 3 秒重试一次**（仅在该 EPC 仍被轮询到时），直到成功或停止采集。
+
 ### 3D.3 代码改动点
 
 | 文件 | 改动 |
 |---|---|
 | `app/protocol.py` | 新增 `MEM_BANK_TID`、`TID_READ_WORDS`、`build_read_tid`；补充 `0xA3` 错误名称 |
-| `app/reader.py` | 新增 EPC → TID 缓存；首次识别新 EPC 时在轮询空闲间隙 Select + 读 TID；新增 `on_tid` 回调与 `get_tid` |
+| `app/reader.py` | 新增 EPC → TID 缓存；首次识别新 EPC 时在轮询空闲间隙 Select + 读 TID；失败每 3 秒重试、单次超时 0.3 秒；新增 `on_tid` 回调与 `get_tid` |
 | `app/ui/main_window.py` | 新增 TID Signal 与两处表格的 TID 列；TID 到达后原地更新行 |
 | `tests/test_protocol.py` | 新增 TID 读组帧断言 |
-| `tests/test_writer.py` | 假串口支持 TID 区；覆盖 12 字节 TID 自适应读取、失败缓存空值 |
+| `tests/test_writer.py` | 假串口支持 TID 区；覆盖 12 字节 TID 自适应读取、失败后自动重试直到成功 |
 | `verify/rfid_server_TID.py` | 新增 TID 版验证服务器，兼容 EPC 数组与 `{"epc","tid"}` 对象数组 |
 | `verify/rfid_server.py` | **不改动** |
 | `README.md` | 补充 TID 读取与显示说明、TID 验证服务器用法 |
