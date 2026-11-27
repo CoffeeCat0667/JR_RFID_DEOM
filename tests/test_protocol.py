@@ -114,6 +114,10 @@ class WriteProtocolTest(unittest.TestCase):
         frame = protocol.build_read_epc(6)
         self.assertEqual(frame.hex().upper(), "BB003900090000000001000200064B7E")
 
+    def test_build_read_tid(self):
+        frame = protocol.build_read_tid(6)
+        self.assertEqual(frame.hex().upper(), "BB003900090000000002000000064A7E")
+
     def test_parse_select_success(self):
         frame = make_frame(protocol.TYPE_RESPONSE, protocol.CMD_SELECT_PARAMS, b"\x00")
         self.assertTrue(protocol.parse_select_success(frame))
@@ -168,7 +172,7 @@ class WriteProtocolTest(unittest.TestCase):
             protocol.prepare_epc_write("00 " * 66)
 
     def test_write_error_names(self):
-        for code in (0x10, 0x16, 0xB3, 0xB4):
+        for code in (0x10, 0x16, 0xA3, 0xB3, 0xB4):
             self.assertNotIn("未知错误码", protocol.error_name(code))
 
 

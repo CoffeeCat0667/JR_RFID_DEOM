@@ -3,7 +3,7 @@
 > 适用版本：`261115Ver1.0`（2026-11-26 修订）
 > 适用对象：维护 / 对接 / 现场排查人员
 > 覆盖范围：从 RFID 读写器采集 EPC → 缓冲聚合 → HTTP 上报服务器的完整链路；以及在“写入”页把标签 EPC 替换为新值的完整链路。
-> 代码基线：`main` 分支（HTTP 上报为 **EPC 字符串数组**；写入页写 **EPC 区**，不再读写 User 区）。
+> 代码基线：`main` 分支（HTTP 上报为 **EPC 字符串数组**；采集时额外读取 **TID** 并在界面显示；写入页写 **EPC 区**，不读写 User 区）。
 
 ---
 
@@ -29,9 +29,9 @@
 
 程序是一个 Windows 桌面工具（Python 3.14 + PySide6 + pyserial），通过串口连接 E310 系列 UHF 读写器：
 
-- **采集**：每 100ms 发送一次单次轮询命令，解析标签通知帧，得到 EPC（大写十六进制）与 RSSI。
+- **采集**：每 100ms 发送一次单次轮询命令，解析标签通知帧，得到 EPC（大写十六进制）与 RSSI；首次识别到新 EPC 时额外读取 TID 并在界面显示。
 - **聚合**：标签进入线程安全缓冲区，按 EPC 去重；连续 2 秒没有“新的唯一 EPC”后整批取出。
-- **上报**：整批以 JSON 字符串数组 POST 到 MES 地址，带 `X-Device-Id`；只有 HTTP 2xx 且响应 `{"ok": true}` 视为成功。
+- **上报**：整批以 JSON 字符串数组 POST 到 MES 地址，带 `X-Device-Id`；只有 HTTP 2xx 且响应 `{"ok": true}` 视为成功。TID 不上报。
 - **写入**：在“写入”页选中已识别的标签，输入 2~30 字节偶数长度的 HEX 作为**新 EPC**，写入标签 EPC 区；PC 按新长度自动计算，CRC 由标签自动更新；写后用新 EPC 重新 Select 并回读校验。
 
 ### 1.1 三线程模型
@@ -52,6 +52,7 @@
 │ (COMx)       │ ◄───────── │ 100ms 单次轮询       │
 └──────────────┘  0x22 命令 └──────────┬──────────┘
                                        │ TagBuffer.add(epc, rssi)
+                                       │ 首次识别新 EPC：Select + 读 TID
                                        ▼
                              ┌─────────────────────┐
                              │ TagBuffer            │
@@ -99,7 +100,8 @@ tests/
 ├── test_protocol.py        组帧/解帧/解析/EPC 长度校验/聚合
 ├── test_uploader.py        真实本地 HTTP 服务器下的上报行为
 └── test_writer.py          EPC 写入流程（假串口 + EPC 区存储模型）
-verify/rfid_server.py       本地接收验证服务器（接受 EPC 字符串数组）
+verify/rfid_server.py       本地接收验证服务器（接受 EPC 字符串数组，本次未改动）
+verify/rfid_server_TID.py    TID 版验证服务器（兼容 EPC 数组与 {"epc","tid"} 对象数组）
 ```
 
 ---
@@ -129,7 +131,7 @@ verify/rfid_server.py       本地接收验证服务器（接受 EPC 字符串�
 | 获取硬件版本 | `0x03` | 握手 | `00` |
 | 单次轮询 | `0x22` | 采集标签 | 无参数 |
 | 设置 Select 参数 | `0x0C` | 选中唯一标签 | `SelParam + Ptr + MaskLen + Truncate + Mask` |
-| 读标签数据存储区 | `0x39` | 写入后回读 EPC 区 | `AP(4) + MemBank + SA(2) + DL(2)` |
+| 读标签数据存储区 | `0x39` | 写入后回读 EPC 区 / 读取 TID | `AP(4) + MemBank + SA(2) + DL(2)` |
 | 写标签数据存储区 | `0x49` | 写 PC + 新 EPC | `AP(4) + MemBank + SA(2) + DL(2) + DT` |
 | 失败响应 | `0xFF` | 错误码 | `错误码 [+ PC + EPC]` |
 
@@ -163,12 +165,16 @@ CMD_WRITE = 0x49
 CMD_ERROR = 0xFF
 
 MEM_BANK_EPC = 0x01
+MEM_BANK_TID = 0x02
 MAX_EPC_MASK_LEN = 31
 MAX_WRITE_EPC_LEN = 30
 
 # EPC 区布局：word0 为 CRC（标签在写入 EPC 后自动更新），word1 为 PC，word2 起为 EPC。
 EPC_SA_PC = 0x0001
 EPC_SA_DATA = 0x0002
+
+# TID 长度因标签而异：依次尝试 8/6/4/2 word，取第一个读取成功的实际长度。
+TID_READ_WORDS = (8, 6, 4, 2)
 
 MAX_PARAM_LEN = 256   # 用于从垃圾字节中重新同步
 
@@ -408,8 +414,13 @@ def _poll_loop(self) -> None:
             outstanding = None
             self._log_throttled("poll-timeout", "轮询响应超时，继续下一轮")
 
-        # 没有在途请求才发下一条，保证单条在途
+        # 没有在途请求时才读 TID / 发下一条轮询，保证单条在途
         if outstanding is None:
+            pending_tid = self._take_tid_read()
+            if pending_tid is not None:
+                self._read_tid(pending_tid)
+                next_poll = time.monotonic() + POLL_INTERVAL
+                continue
             self._write(protocol.SINGLE_POLL_CMD)
             self.polls += 1
             outstanding = now
@@ -472,16 +483,122 @@ def _on_tag(self, tag: protocol.TagRead) -> None:
         self._log_throttled("pc-mismatch",
                             f"EPC 长度与 PC 不一致（{tag.epc}），已按帧长度处理")
     self._buffer.add(tag.epc, tag.rssi)
+    self._queue_tid_read(tag.epc)
     self._emit(self.on_tag, tag.epc, tag.rssi)
 ```
 
 - EPC 统一转成**大写无空格十六进制字符串**作为后续所有环节的键。
 - RSSI 按有符号字节处理（>127 减 256）。
 - `pc_mismatch` 只影响日志，不丢数据：始终以帧内实际 EPC 长度为准。
-- 采集过程中**不访问标签存储区**，只解析轮询通知帧。
+- 采集只额外读取 TID（见 4.6），不读写 User 区。
 - `on_tag` 回调经 Qt Signal 送到主线程刷新表格。
 
-### 4.6 缓冲区（`app/buffer.py`）
+### 4.6 TID 读取与缓存（首次识别）
+
+TID 只用于界面显示，**不进入 HTTP 上报**。策略是“首次识别时读一次并按 EPC 缓存”：
+
+- 轮询第一次识别到某个唯一 EPC 时，把它放入待读队列。
+- 在没有在途轮询时，执行 `0x0C Select` + `0x39 读 TID`（`MemBank=0x02`、`SA=0`）。
+- TID 长度因标签而异：依次尝试 `DL=8/6/4/2 word`，取第一个成功的实际长度，不补齐。
+- 读取失败（超时、`0xA3` 存储区越界、回读 EPC 不一致）→ 该 EPC 缓存空字符串，界面显示 `—`。
+- 同一次采集运行内同一 EPC 只读一次；停止采集后缓存随 `Reader` 丢弃。
+- 写入页成功改写 EPC 后，把 TID 缓存从旧 EPC 移到新 EPC。
+
+协议常量与组帧（`app/protocol.py`）：
+
+```python
+MEM_BANK_TID = 0x02
+TID_READ_WORDS = (8, 6, 4, 2)
+
+
+def build_read_tid(words: int, access_password: int = 0) -> bytes:
+    """4.7 读标签数据存储区：TID 区从 SA=0 开始。"""
+    if words < 1 or words > 32:
+        raise ValueError("读取长度必须为 1~32 word")
+    param = (
+        access_password.to_bytes(4, "big")
+        + bytes([MEM_BANK_TID])
+        + b"\x00\x00"
+        + words.to_bytes(2, "big")
+    )
+    return build_frame(TYPE_COMMAND, CMD_READ, param)
+```
+
+缓存与读取（`app/reader.py`）：
+
+```python
+self._tid_cache: dict[str, str] = {}
+self._tid_pending: deque[str] = deque()
+self._tid_queued: set[str] = set()
+self._tid_lock = threading.Lock()
+
+
+def get_tid(self, epc: str) -> str:
+    """已读取的 TID（大写 HEX，实际长度）；未读到或读取失败时为空字符串。"""
+    with self._tid_lock:
+        return self._tid_cache.get(epc, "")
+
+
+def _queue_tid_read(self, epc: str) -> None:
+    with self._tid_lock:
+        if epc in self._tid_cache or epc in self._tid_queued:
+            return
+        self._tid_queued.add(epc)
+        self._tid_pending.append(epc)
+
+
+def _take_tid_read(self) -> str | None:
+    with self._tid_lock:
+        while self._tid_pending:
+            epc = self._tid_pending.popleft()
+            self._tid_queued.discard(epc)
+            if epc not in self._tid_cache:
+                return epc
+    return None
+
+
+def _set_tid(self, epc: str, data: bytes) -> None:
+    with self._tid_lock:
+        self._tid_cache[epc] = data.hex().upper()
+
+
+def _read_tid(self, epc: str) -> None:
+    select_ok, message = self._select_mask(epc)
+    if select_ok:
+        for words in protocol.TID_READ_WORDS:
+            read_ok, actual, read_epc, message = self._read_tid_data(words)
+            if read_ok and read_epc == epc:
+                self._set_tid(epc, actual)
+                self._log(f"TID：{epc} → {actual.hex().upper()}")
+                return
+            if read_ok:
+                message = "回读 EPC 与所选不一致"
+                break
+            if "0xA3" not in message:
+                break
+    self._set_tid(epc, b"")
+    self._log(f"读取标签 TID 失败，界面按空值处理：{epc}（{message}）")
+```
+
+轮询循环中的调度（在无在途轮询、且没有待执行写入任务时执行一次）：
+
+```python
+if outstanding is None:
+    pending_tid = self._take_tid_read()
+    if pending_tid is not None:
+        self._read_tid(pending_tid)
+        next_poll = time.monotonic() + POLL_INTERVAL
+        continue
+    self._write(protocol.SINGLE_POLL_CMD)
+```
+
+要点：
+
+- 读 TID 放在轮询超时处理之后、发送下一条轮询之前，避免因“通知帧不清除在途标记”而一直得不到执行。
+- `0xA3` 表示请求长度超过标签 TID 区容量，程序自动缩短长度重试；其它错误或超时直接放弃。
+- 一次 TID 读取通常需要 1~2 条 `0x39` 命令（12 字节 TID 先读 8 word 失败，再读 6 word 成功）。
+
+### 4.7 缓冲区（`app/buffer.py`）
 
 ```python
 class TagBuffer:
@@ -699,7 +816,7 @@ else:
 | 回读 | 写后用**新 EPC** 重新 Select，再读 EPC 区 `SA=2` |
 | 回读不一致 / 超时 | 直接失败，**不自动重写**（旧 EPC 可能已不存在） |
 | 写错误 | 直接失败，不重试 |
-| 成功后界面 | 写入页表格中该行 EPC 替换为新值 |
+| 成功后界面 | 写入页表格中该行 EPC 替换为新值；该行 TID 列保持不变（TID 是芯片唯一标识，不随 EPC 改变） |
 
 ### 6.2 数据校验（`prepare_epc_write`）
 
@@ -934,7 +1051,8 @@ def _wait_response(self, command: int) -> protocol.Frame | None:
 
 ### 6.9 写入成功后的界面与数据
 
-- 写入页表格中该行 EPC 原地替换为新值；当前选择同步更新。
+- 写入页表格中该行 EPC 原地替换为新值；当前选择同步更新；TID 列保持不变。
+- 写入成功后 TID 缓存从旧 EPC 移到新 EPC，后续不会为新 EPC 重复读 TID。
 - 采集页“最近标签”与缓冲区中已存在的旧 EPC 不做历史回改；轮询到新 EPC 后会作为新标签出现。
 - 如果旧 EPC 已经上报过，MES 侧会先后看到旧 EPC 与新 EPC，需要业务侧自行处理。
 
@@ -949,6 +1067,7 @@ def _wait_response(self, command: int) -> protocol.Frame | None:
 ```python
 class Bridge(QObject):
     tag = Signal(str, object)
+    tid = Signal(str, str)
     version = Signal(str)
     handshake_failed = Signal(str)
     runtime_error = Signal(str)
@@ -963,6 +1082,7 @@ class Bridge(QObject):
 self._reader = Reader(
     port, baud, self._buffer,
     on_tag=self._bridge.tag.emit,
+    on_tid=self._bridge.tid.emit,
     on_version=self._bridge.version.emit,
     on_handshake_failed=self._bridge.handshake_failed.emit,
     on_runtime_error=self._bridge.runtime_error.emit,
@@ -1048,24 +1168,54 @@ def _stop(self) -> None:
 
 ### 7.4 标签表与唯一标签表
 
-- 采集页“最近标签”：每次读到标签插入首行，最多保留 `MAX_TAG_ROWS = 50` 行。
-- 写入页“识别到的标签（唯一）”：按 EPC 原地更新 RSSI 与最后识别时间，不在重复时新增行。
+- 采集页“最近标签”：`EPC / TID / RSSI / 时间`，每次读到标签插入首行，最多保留 `MAX_TAG_ROWS = 50` 行。
+- 写入页“识别到的标签（唯一）”：`EPC / TID / RSSI / 最后识别`，按 EPC 原地更新 RSSI 与最后识别时间，不在重复时新增行。
 - 写入页选择某行后，“当前选择”显示 EPC，输入合法才启用“写入”按钮。
+- TID 读取完成后通过 `on_tid` Signal 送到主线程，原地更新两个表格中对应 EPC 的 TID 列；未读到显示 `—`。
 
 ```python
-def _record_unique_tag(self, epc: str, rssi_text: str, stamp: str) -> None:
+def _on_tag(self, epc: str, rssi: object) -> None:
+    tid = self._reader.get_tid(epc) if self._reader is not None else ""
+    self.tag_table.insertRow(0)
+    self.tag_table.setItem(0, 0, QTableWidgetItem(epc))
+    self.tag_table.setItem(0, 1, QTableWidgetItem(tid or "—"))
+    rssi_text = f"{rssi} dBm" if rssi is not None else "—"
+    self.tag_table.setItem(0, 2, QTableWidgetItem(rssi_text))
+    stamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    self.tag_table.setItem(0, 3, QTableWidgetItem(stamp))
+    while self.tag_table.rowCount() > MAX_TAG_ROWS:
+        self.tag_table.removeRow(self.tag_table.rowCount() - 1)
+    self._record_unique_tag(epc, tid, rssi_text, stamp)
+
+
+def _on_tid(self, epc: str, tid: str) -> None:
+    text = tid or "—"
+    for row in range(self.tag_table.rowCount()):
+        item = self.tag_table.item(row, 0)
+        if item is not None and item.text() == epc:
+            self.tag_table.item(row, 1).setText(text)
+    for row in range(self.unique_table.rowCount()):
+        item = self.unique_table.item(row, 0)
+        if item is not None and item.text() == epc:
+            self.unique_table.item(row, 1).setText(text)
+            return
+
+
+def _record_unique_tag(self, epc: str, tid: str, rssi_text: str, stamp: str) -> None:
     for row in range(self.unique_table.rowCount()):
         if self.unique_table.item(row, 0).text() == epc:
-            self.unique_table.item(row, 1).setText(rssi_text)
-            self.unique_table.item(row, 2).setText(stamp)
+            self.unique_table.item(row, 1).setText(tid or "—")
+            self.unique_table.item(row, 2).setText(rssi_text)
+            self.unique_table.item(row, 3).setText(stamp)
             if self._is_selected_row(row):
                 self._update_write_button()
             return
     row = self.unique_table.rowCount()
     self.unique_table.insertRow(row)
     self.unique_table.setItem(row, 0, QTableWidgetItem(epc))
-    self.unique_table.setItem(row, 1, QTableWidgetItem(rssi_text))
-    self.unique_table.setItem(row, 2, QTableWidgetItem(stamp))
+    self.unique_table.setItem(row, 1, QTableWidgetItem(tid or "—"))
+    self.unique_table.setItem(row, 2, QTableWidgetItem(rssi_text))
+    self.unique_table.setItem(row, 3, QTableWidgetItem(stamp))
 ```
 
 ### 7.5 写入按钮使能
@@ -1200,15 +1350,17 @@ def _on_write_result(self, result: dict) -> None:
 | `REQUEUE_PAUSE` | 1.0s | `uploader.py` | 回填后暂停 |
 | `DEFAULT_DEVICE_ID` | `RFID-PLATE-001` | `uploader.py` | 设备 ID 默认值 |
 
-### 9.3 写入
+### 9.3 写入 / TID
 
 | 常量 | 值 | 位置 | 说明 |
 |---|---|---|---|
 | `MEM_BANK_EPC` | `0x01` | `protocol.py` | EPC 存储区 |
+| `MEM_BANK_TID` | `0x02` | `protocol.py` | TID 存储区 |
 | `EPC_SA_PC` | `0x0001` | `protocol.py` | PC 所在 word |
 | `EPC_SA_DATA` | `0x0002` | `protocol.py` | EPC 数据起始 word |
 | `MAX_WRITE_EPC_LEN` | 30 字节 | `protocol.py` | 新 EPC 上限 |
 | `MAX_EPC_MASK_LEN` | 31 字节 | `protocol.py` | Select 掩码字节上限 |
+| `TID_READ_WORDS` | `(8, 6, 4, 2)` | `protocol.py` | TID 自适应读取长度 |
 
 ### 9.4 界面
 
@@ -1229,6 +1381,7 @@ def _on_write_result(self, result: dict) -> None:
 | `0x16` | 访问密码错误 | 标签有 Access Password |
 | `0x17` | 指令代码错误 | 固件不支持 |
 | `0x20` | 跳频搜索超时 | 信道搜索超时 |
+| `0xA3` | 存储区越界（读） | 读取长度超过 TID 区容量 |
 | `0xB3` | 存储区越界 | 新 EPC 超过标签容量 |
 | `0xB4` | 存储区锁定 | EPC 区被 Lock |
 
@@ -1253,6 +1406,7 @@ Reader 线程
        ├─ 收到通知帧 → parse_tag → buffer.add → on_tag → 界面
        ├─ 收到 0x22 响应 → 本轮结束
        ├─ 收到 0x15 → 空盘 +1
+       ├─ 首次识别新 EPC → 空闲时 Select + 读 TID（8/6/4/2 word）
        └─ 250ms 无响应 → 超时 +1，继续
 
 Uploader 线程
@@ -1290,7 +1444,7 @@ Reader 轮询循环
 
 ## 11. 测试与验证
 
-### 11.1 单元测试（41 个，全部通过）
+### 11.1 单元测试（43 个，全部通过）
 
 ```bat
 python -m unittest discover -s tests -v
@@ -1300,9 +1454,9 @@ python -m unittest discover -s tests -v
 
 | 测试文件 | 覆盖点 |
 |---|---|
-| `tests/test_protocol.py` | 手册样例帧解析、拆包/粘包、垃圾字节、校验错误重同步、载荷含 `0x7E/0xBB`、错误帧携带 EPC、EPC 区写/读组帧、EPC 长度校验、2 秒静默聚合 |
+| `tests/test_protocol.py` | 手册样例帧解析、拆包/粘包、垃圾字节、校验错误重同步、载荷含 `0x7E/0xBB`、错误帧携带 EPC、EPC 区写/读组帧、TID 读组帧、EPC 长度校验、2 秒静默聚合 |
 | `tests/test_uploader.py` | 真实本地 HTTP 服务器：EPC 字符串数组、去重、`X-Device-Id`、`ok:false`/400 丢弃、5xx 重试、非法响应丢弃、失败回填 |
-| `tests/test_writer.py` | 假串口 + EPC 区存储模型：写入成功、PC 重算、写错误、回读超时、回读不一致、写入期间暂停轮询、采集不访问 User 区 |
+| `tests/test_writer.py` | 假串口 + EPC/TID 存储模型：EPC 写入成功、PC 重算、写错误、回读超时、回读不一致、写入期间暂停轮询、TID 自适应读取、TID 读取失败缓存空值 |
 
 ### 11.2 本地接收验证服务器
 
@@ -1314,7 +1468,17 @@ python verify\rfid_server.py 8000
 - 上报地址：`http://<本机IP>:8000/api/epc`
 - 接受 `["EPC1", "EPC2"]` 字符串数组，与本工具一致。
 
-### 11.3 界面冒烟
+### 11.3 TID 版验证服务器
+
+```bat
+python verify\rfid_server_TID.py 8000
+```
+
+- 兼容 `["EPC1", "EPC2"]` 和 `[{"epc": "...", "tid": "..."}]` 两种请求体。
+- 页面增加 TID 列；当前工具只上报 EPC，TID 列显示 `—`。
+- 原 `verify\rfid_server.py` 未改动。
+
+### 11.4 界面冒烟
 
 项目通过 offscreen 界面冒烟：假串口下完成采集、显示标签、写入 EPC 区、回读校验、配置持久化。
 
@@ -1337,6 +1501,10 @@ python verify\rfid_server.py 8000
 13. **缓冲区满时淘汰最早插入项**：极端高并发下会丢弃旧数据并累计 `dropped`，界面不显示该计数。
 14. **单文件 exe**：PyInstaller onefile，运行时会有常驻子进程；强制结束需结束所有同名进程。
 15. **HTTP 协议**：当前请求体是 EPC 字符串数组，与 `docs/RFID检测板对接协议.md` 一致；若 MES 改为对象格式，需要同步修改 `Uploader.run()`。
+16. **TID 仅本地显示**：TID 不进入 HTTP 上报；如需上报，需同步修改 `Uploader` 与验证服务器。
+17. **TID 读取有额外开销**：每个新 EPC 首次识别时多 1~2 条 `0x39` 命令（12 字节 TID 为 8 word 失败 + 6 word 成功），期间暂停一次轮询。
+18. **TID 读取失败不重试**：超时、无 TID 区或回读 EPC 不一致时缓存空值，界面显示 `—`，后续不再重读。
+19. **TID 长度按实际返回**：依次尝试 8/6/4/2 word，不补齐；超过 8 word（16 字节）的 TID 会被截断为 16 字节。
 
 ---
 
@@ -1356,6 +1524,8 @@ python verify\rfid_server.py 8000
 | 轮询循环 | `app/reader.py` | `_poll_loop` |
 | 帧分发 | `app/reader.py` | `_handle_frame` |
 | 标签入缓冲 | `app/reader.py` | `_on_tag` |
+| TID 缓存与读取 | `app/reader.py` | `get_tid`、`_queue_tid_read`、`_read_tid`、`_set_tid` |
+| TID 读组帧 | `app/protocol.py` | `build_read_tid` |
 | 写入任务提交 | `app/reader.py` | `submit_epc_write` |
 | 写入状态机 | `app/reader.py` | `_run_write_job` |
 | 写入命令封装 | `app/reader.py` | `_select_mask`、`_write_epc`、`_read_epc` |
@@ -1364,8 +1534,10 @@ python verify\rfid_server.py 8000
 | 取批 / 上报 / 重试 | `app/uploader.py` | `Uploader.run`、`_post`、`_parse_response` |
 | 界面装配 | `app/ui/main_window.py` | `_on_start`、`_on_version`、`_stop`、`_on_write` |
 | 写入成功后替换 EPC 行 | `app/ui/main_window.py` | `_replace_epc_row` |
+| TID 界面更新 | `app/ui/main_window.py` | `_on_tag`、`_on_tid`、`_record_unique_tag` |
 | 配置 / 日志 | `app/config.py` | `load_config`、`save_config`、`setup_logging` |
-| 本地验证服务器 | `verify/rfid_server.py` | `Handler.do_POST`（接受字符串数组） |
+| 本地验证服务器 | `verify/rfid_server.py` | `Handler.do_POST`（仅 EPC 字符串数组） |
+| TID 版验证服务器 | `verify/rfid_server_TID.py` | `Handler.do_POST`（兼容 EPC 数组与对象数组） |
 
 ---
 

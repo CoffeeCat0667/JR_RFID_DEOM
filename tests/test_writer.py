@@ -10,6 +10,8 @@ OLD_EPC = "30751FEB705C5904E3D50D70"
 NEW_EPC = "E2003412AABBCCDD"
 NEW_EPC_LONG = "E2003412AABBCCDDEEFF0011"
 OTHER_EPC = "112233445566778899AABBCC"
+TID_HEX = "E280116060000205AABBCCDD"
+TID = bytes.fromhex(TID_HEX)
 
 VERSION_RESPONSE = bytes.fromhex("BB 01 03 00 0B 00 4D 31 30 30 20 56 31 2E 30 30 22 7E")
 POLL_OK = protocol.build_frame(protocol.TYPE_RESPONSE, protocol.CMD_SINGLE_POLL, b"\x00")
@@ -23,6 +25,7 @@ class FakeSerial:
         self.writes = []
         self.epc = bytearray.fromhex(OLD_EPC)
         self.pc = (len(self.epc) // 2) << 11
+        self.tid = bytearray(TID)
         self.selected: str | None = None
         self.read_epc_override: str | None = None
         self.ignore_writes = 0
@@ -125,7 +128,12 @@ class FakeSerial:
             mem_bank = param[4]
             sa = (param[5] << 8) | param[6]
             dl = (param[7] << 8) | param[8]
-            if mem_bank == protocol.MEM_BANK_EPC and sa >= protocol.EPC_SA_DATA:
+            if mem_bank == protocol.MEM_BANK_TID:
+                if dl * 2 > len(self.tid):
+                    self.rx.extend(self._error(0xA3))
+                    return
+                tail = bytes(self.tid[: dl * 2])
+            elif mem_bank == protocol.MEM_BANK_EPC and sa >= protocol.EPC_SA_DATA:
                 base = (sa - protocol.EPC_SA_DATA) * 2
                 tail = bytes(self.epc[base : base + dl * 2])
             else:
@@ -261,22 +269,51 @@ class WriterLoopTest(unittest.TestCase):
             time.sleep(0.02)
         return False
 
-    def test_first_sighting_does_not_access_user_bank(self):
+    def _read_banks(self, fake: FakeSerial) -> list[int]:
+        banks = []
+        for frame in fake.writes:
+            if frame[2] != protocol.CMD_READ:
+                continue
+            length = (frame[3] << 8) | frame[4]
+            banks.append(frame[5 : 5 + length][4])
+        return banks
+
+    def test_first_sighting_reads_tid_once(self):
         reader = Reader("COM1", 115200, TagBuffer())
         reader.start()
         self.assertTrue(self.wait_for(lambda: bool(reader.version)))
         fake = FakeSerial.last
         fake.poll_tag = OLD_EPC
 
+        self.assertTrue(self.wait_for(lambda: reader.get_tid(OLD_EPC) == TID_HEX))
+        banks = self._read_banks(fake)
+        self.assertTrue(banks)
+        self.assertTrue(all(bank == protocol.MEM_BANK_TID for bank in banks))
+        self.assertEqual(len(banks), 2)  # 8 word 返回 0xA3，6 word 成功
+        self.assertNotIn(0x03, banks)
+
+        time.sleep(0.3)
+        self.assertEqual(len(self._read_banks(fake)), 2)
+
+        reader.stop()
+        reader.join(timeout=3)
+
+    def test_tid_read_failure_caches_empty_once(self):
+        reader = Reader("COM1", 115200, TagBuffer())
+        reader.start()
+        self.assertTrue(self.wait_for(lambda: bool(reader.version)))
+        fake = FakeSerial.last
+        fake.tid = bytearray()
+        fake.poll_tag = OLD_EPC
+
         self.assertTrue(
             self.wait_for(
-                lambda: any(frame[2] == protocol.CMD_SINGLE_POLL for frame in fake.writes)
+                lambda: len(self._read_banks(fake)) == len(protocol.TID_READ_WORDS)
             )
         )
         time.sleep(0.3)
-        commands = [frame[2] for frame in fake.writes]
-        self.assertNotIn(protocol.CMD_SELECT_PARAMS, commands)
-        self.assertNotIn(protocol.CMD_READ, commands)
+        self.assertEqual(len(self._read_banks(fake)), len(protocol.TID_READ_WORDS))
+        self.assertEqual(reader.get_tid(OLD_EPC), "")
 
         reader.stop()
         reader.join(timeout=3)

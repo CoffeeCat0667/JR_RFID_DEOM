@@ -42,6 +42,7 @@ STATS_INTERVAL_MS = 500
 
 class Bridge(QObject):
     tag = Signal(str, object)
+    tid = Signal(str, str)
     version = Signal(str)
     handshake_failed = Signal(str)
     runtime_error = Signal(str)
@@ -66,6 +67,7 @@ class MainWindow(QMainWindow):
 
         self._bridge = Bridge(self)
         self._bridge.tag.connect(self._on_tag)
+        self._bridge.tid.connect(self._on_tid)
         self._bridge.version.connect(self._on_version)
         self._bridge.handshake_failed.connect(self._on_handshake_failed)
         self._bridge.runtime_error.connect(self._on_runtime_error)
@@ -160,8 +162,8 @@ class MainWindow(QMainWindow):
 
         tags = QGroupBox("最近标签")
         tags_layout = QVBoxLayout(tags)
-        self.tag_table = QTableWidget(0, 3)
-        self.tag_table.setHorizontalHeaderLabels(["EPC", "RSSI", "时间"])
+        self.tag_table = QTableWidget(0, 4)
+        self.tag_table.setHorizontalHeaderLabels(["EPC", "TID", "RSSI", "时间"])
         self.tag_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.tag_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.tag_table.verticalHeader().setVisible(False)
@@ -169,6 +171,7 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self.tag_table.setMaximumHeight(190)
         tags_layout.addWidget(self.tag_table)
         layout.addWidget(tags)
@@ -194,8 +197,8 @@ class MainWindow(QMainWindow):
 
         tags = QGroupBox("识别到的标签（唯一）")
         tags_layout = QVBoxLayout(tags)
-        self.unique_table = QTableWidget(0, 3)
-        self.unique_table.setHorizontalHeaderLabels(["EPC", "RSSI", "最后识别"])
+        self.unique_table = QTableWidget(0, 4)
+        self.unique_table.setHorizontalHeaderLabels(["EPC", "TID", "RSSI", "最后识别"])
         self.unique_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.unique_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.unique_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
@@ -204,6 +207,7 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self.unique_table.itemSelectionChanged.connect(self._update_write_button)
         tags_layout.addWidget(self.unique_table)
         layout.addWidget(tags, 1)
@@ -307,6 +311,7 @@ class MainWindow(QMainWindow):
             baud,
             self._buffer,
             on_tag=self._bridge.tag.emit,
+            on_tid=self._bridge.tid.emit,
             on_version=self._bridge.version.emit,
             on_handshake_failed=self._bridge.handshake_failed.emit,
             on_runtime_error=self._bridge.runtime_error.emit,
@@ -379,29 +384,45 @@ class MainWindow(QMainWindow):
         self._uploader.start()
 
     def _on_tag(self, epc: str, rssi: object) -> None:
+        tid = self._reader.get_tid(epc) if self._reader is not None else ""
         self.tag_table.insertRow(0)
         self.tag_table.setItem(0, 0, QTableWidgetItem(epc))
+        self.tag_table.setItem(0, 1, QTableWidgetItem(tid or "—"))
         rssi_text = f"{rssi} dBm" if rssi is not None else "—"
-        self.tag_table.setItem(0, 1, QTableWidgetItem(rssi_text))
+        self.tag_table.setItem(0, 2, QTableWidgetItem(rssi_text))
         stamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-        self.tag_table.setItem(0, 2, QTableWidgetItem(stamp))
+        self.tag_table.setItem(0, 3, QTableWidgetItem(stamp))
         while self.tag_table.rowCount() > MAX_TAG_ROWS:
             self.tag_table.removeRow(self.tag_table.rowCount() - 1)
-        self._record_unique_tag(epc, rssi_text, stamp)
+        self._record_unique_tag(epc, tid, rssi_text, stamp)
 
-    def _record_unique_tag(self, epc: str, rssi_text: str, stamp: str) -> None:
+    def _on_tid(self, epc: str, tid: str) -> None:
+        text = tid or "—"
+        for row in range(self.tag_table.rowCount()):
+            item = self.tag_table.item(row, 0)
+            if item is not None and item.text() == epc:
+                self.tag_table.item(row, 1).setText(text)
+        for row in range(self.unique_table.rowCount()):
+            item = self.unique_table.item(row, 0)
+            if item is not None and item.text() == epc:
+                self.unique_table.item(row, 1).setText(text)
+                return
+
+    def _record_unique_tag(self, epc: str, tid: str, rssi_text: str, stamp: str) -> None:
         for row in range(self.unique_table.rowCount()):
             if self.unique_table.item(row, 0).text() == epc:
-                self.unique_table.item(row, 1).setText(rssi_text)
-                self.unique_table.item(row, 2).setText(stamp)
+                self.unique_table.item(row, 1).setText(tid or "—")
+                self.unique_table.item(row, 2).setText(rssi_text)
+                self.unique_table.item(row, 3).setText(stamp)
                 if self._is_selected_row(row):
                     self._update_write_button()
                 return
         row = self.unique_table.rowCount()
         self.unique_table.insertRow(row)
         self.unique_table.setItem(row, 0, QTableWidgetItem(epc))
-        self.unique_table.setItem(row, 1, QTableWidgetItem(rssi_text))
-        self.unique_table.setItem(row, 2, QTableWidgetItem(stamp))
+        self.unique_table.setItem(row, 1, QTableWidgetItem(tid or "—"))
+        self.unique_table.setItem(row, 2, QTableWidgetItem(rssi_text))
+        self.unique_table.setItem(row, 3, QTableWidgetItem(stamp))
 
     def _is_selected_row(self, row: int) -> bool:
         return any(index.row() == row for index in self.unique_table.selectedIndexes())

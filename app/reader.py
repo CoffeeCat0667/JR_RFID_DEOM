@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import deque
 from typing import Callable
 
 import serial
@@ -29,6 +30,7 @@ class Reader(threading.Thread):
         baudrate: int,
         buffer: TagBuffer,
         on_tag: Callable[[str, int | None], None] | None = None,
+        on_tid: Callable[[str, str], None] | None = None,
         on_version: Callable[[str], None] | None = None,
         on_handshake_failed: Callable[[str], None] | None = None,
         on_runtime_error: Callable[[str], None] | None = None,
@@ -41,6 +43,7 @@ class Reader(threading.Thread):
         self.baudrate = baudrate
         self._buffer = buffer
         self.on_tag = on_tag
+        self.on_tid = on_tid
         self.on_version = on_version
         self.on_handshake_failed = on_handshake_failed
         self.on_runtime_error = on_runtime_error
@@ -62,6 +65,10 @@ class Reader(threading.Thread):
         self._last_log: dict[str, float] = {}
         self._write_job: tuple[str, bytes] | None = None
         self._write_lock = threading.Lock()
+        self._tid_cache: dict[str, str] = {}
+        self._tid_pending: deque[str] = deque()
+        self._tid_queued: set[str] = set()
+        self._tid_lock = threading.Lock()
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -74,6 +81,11 @@ class Reader(threading.Thread):
                 return False
             self._write_job = (epc, data)
         return True
+
+    def get_tid(self, epc: str) -> str:
+        """已读取的 TID（大写 HEX，实际长度）；未读到或读取失败时为空字符串。"""
+        with self._tid_lock:
+            return self._tid_cache.get(epc, "")
 
     def run(self) -> None:
         try:
@@ -155,6 +167,11 @@ class Reader(threading.Thread):
                 outstanding = None
                 self._log_throttled("poll-timeout", "轮询响应超时，继续下一轮")
             if outstanding is None:
+                pending_tid = self._take_tid_read()
+                if pending_tid is not None:
+                    self._read_tid(pending_tid)
+                    next_poll = time.monotonic() + POLL_INTERVAL
+                    continue
                 self._write(protocol.SINGLE_POLL_CMD)
                 self.polls += 1
                 outstanding = now
@@ -195,6 +212,43 @@ class Reader(threading.Thread):
                 self.writing = True
         return job
 
+    def _queue_tid_read(self, epc: str) -> None:
+        with self._tid_lock:
+            if epc in self._tid_cache or epc in self._tid_queued:
+                return
+            self._tid_queued.add(epc)
+            self._tid_pending.append(epc)
+
+    def _take_tid_read(self) -> str | None:
+        with self._tid_lock:
+            while self._tid_pending:
+                epc = self._tid_pending.popleft()
+                self._tid_queued.discard(epc)
+                if epc not in self._tid_cache:
+                    return epc
+        return None
+
+    def _set_tid(self, epc: str, data: bytes) -> None:
+        with self._tid_lock:
+            self._tid_cache[epc] = data.hex().upper()
+
+    def _read_tid(self, epc: str) -> None:
+        select_ok, message = self._select_mask(epc)
+        if select_ok:
+            for words in protocol.TID_READ_WORDS:
+                read_ok, actual, read_epc, message = self._read_tid_data(words)
+                if read_ok and read_epc == epc:
+                    self._set_tid(epc, actual)
+                    self._log(f"TID：{epc} → {actual.hex().upper()}")
+                    return
+                if read_ok:
+                    message = "回读 EPC 与所选不一致"
+                    break
+                if "0xA3" not in message:
+                    break
+        self._set_tid(epc, b"")
+        self._log(f"读取标签 TID 失败，界面按空值处理：{epc}（{message}）")
+
     def _run_write_job(self, epc: str, data: bytes) -> None:
         self._emit(self.on_write_state, True)
         expected = data.hex().upper()
@@ -229,6 +283,11 @@ class Reader(threading.Thread):
         finally:
             with self._write_lock:
                 self.writing = False
+            if ok:
+                with self._tid_lock:
+                    tid = self._tid_cache.pop(epc, None)
+                    if tid:
+                        self._tid_cache[expected] = tid
             self._emit(self.on_write_state, False)
             self._emit(
                 self.on_write_result,
@@ -278,6 +337,18 @@ class Reader(threading.Thread):
         read_epc, data = result
         return True, data, read_epc, ""
 
+    def _read_tid_data(self, words: int) -> tuple[bool, bytes, str | None, str]:
+        frame = self._command(protocol.build_read_tid(words), protocol.CMD_READ)
+        if frame is None:
+            return False, b"", None, "回读超时"
+        if frame.command == protocol.CMD_ERROR:
+            return False, b"", None, self._error_message(frame)
+        result = protocol.parse_read_data(frame)
+        if result is None:
+            return False, b"", None, "回读响应无效"
+        read_epc, data = result
+        return True, data, read_epc, ""
+
     def _error_message(self, frame: protocol.Frame) -> str:
         error = protocol.parse_error(frame)
         if error is None:
@@ -303,6 +374,7 @@ class Reader(threading.Thread):
         if tag.pc_mismatch:
             self._log_throttled("pc-mismatch", f"EPC 长度与 PC 不一致（{tag.epc}），已按帧长度处理")
         self._buffer.add(tag.epc, tag.rssi)
+        self._queue_tid_read(tag.epc)
         self._emit(self.on_tag, tag.epc, tag.rssi)
 
     def _read_frames(self) -> list[protocol.Frame]:

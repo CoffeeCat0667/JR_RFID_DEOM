@@ -19,12 +19,16 @@ CMD_WRITE = 0x49
 CMD_ERROR = 0xFF
 
 MEM_BANK_EPC = 0x01
+MEM_BANK_TID = 0x02
 MAX_EPC_MASK_LEN = 31
 MAX_WRITE_EPC_LEN = 30
 
 # EPC 区布局：word0 为 CRC（标签在写入 EPC 后自动更新），word1 为 PC，word2 起为 EPC。
 EPC_SA_PC = 0x0001
 EPC_SA_DATA = 0x0002
+
+# TID 长度因标签而异：依次尝试 8/6/4/2 word，取第一个读取成功的实际长度。
+TID_READ_WORDS = (8, 6, 4, 2)
 
 # 协议中所有已定义帧的参数长度都远小于该值，用于从垃圾字节中重新同步。
 MAX_PARAM_LEN = 256
@@ -89,6 +93,19 @@ def build_read_epc(words: int, access_password: int = 0) -> bytes:
         access_password.to_bytes(4, "big")
         + bytes([MEM_BANK_EPC])
         + EPC_SA_DATA.to_bytes(2, "big")
+        + words.to_bytes(2, "big")
+    )
+    return build_frame(TYPE_COMMAND, CMD_READ, param)
+
+
+def build_read_tid(words: int, access_password: int = 0) -> bytes:
+    """4.7 读标签数据存储区：TID 区从 SA=0 开始。"""
+    if words < 1 or words > 32:
+        raise ValueError("读取长度必须为 1~32 word")
+    param = (
+        access_password.to_bytes(4, "big")
+        + bytes([MEM_BANK_TID])
+        + b"\x00\x00"
         + words.to_bytes(2, "big")
     )
     return build_frame(TYPE_COMMAND, CMD_READ, param)
@@ -266,6 +283,7 @@ ERROR_NAMES = {
     0x16: "访问密码错误",
     0x17: "命令帧中指令代码错误",
     0x20: "跳频搜索信道超时",
+    0xA3: "存储区越界（Memory Overrun，读）",
     0xB3: "存储区越界（Memory Overrun）",
     0xB4: "存储区已锁定（Memory Locked）",
 }
